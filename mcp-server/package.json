@@ -1,0 +1,45 @@
+{
+  "name": "aegis-mcp-server",
+  "version": "1.0.0",
+  "description": "Project Aegis — MCP Context Bridge Server",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "ts-node --esm src/index.ts",
+    "build": "tsc && chmod 755 dist/index.js",
+    "start": "node dist/index.js",
+    "test": "jest --passWithNoTests"
+  },
+  "bin": {
+    "aegis-mcp-server": "./dist/index.js"
+  },
+  "files": ["dist"],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.11",
+    "@types/node": "^20.10.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.1",
+    "typescript": "^5.3.3"
+  },
+  "jest": {
+    "preset": "ts-jest",
+    "testEnvironment": "node",
+    "moduleNameMapper": {
+      "^(\\.{1,2}/.*)\\.js$": "$1"
+    },
+    "transform": {
+      "^.+\\.tsx?$": ["ts-jest", {
+        "useESM": false,
+        "tsconfig": {
+          "module": "CommonJS",
+          "moduleResolution": "node",
+          "target": "ES2022",
+          "isolatedModules": true
+        }
+      }]
+    }
+  }
+}

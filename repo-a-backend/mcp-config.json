@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "aegis-context-bridge": {
+      "command": "node",
+      "args": ["mcp-server/dist/index.js"],
+      "env": {
+        "REPO_B_PATH": "./repo-b"
+      }
+    }
+  }
+}

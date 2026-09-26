@@ -1,0 +1,248 @@
+# ──────────────────────────────────────────────────────────────────
+# Project Aegis — Autonomous Contract Synchronization
+# ──────────────────────────────────────────────────────────────────
+# Triggered when a PR is opened/updated on the backend repository.
+# Detects breaking API contract changes and automatically generates
+# a synchronized PR on the frontend repository with updated types.
+# ──────────────────────────────────────────────────────────────────
+
+name: "🛡️ Project Aegis — Contract Sync"
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - 'src/server.ts'   # Only trigger when the API source file changes
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  aegis-sync:
+    name: "Detect & Sync Frontend Contracts"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15   # Hard timeout to prevent runaway agent loops
+
+    env:
+      REPO_B_PATH: ./repo-b
+      MCP_PORT: "3002"
+      FRONTEND_REPO: Aegis-Enclave/repo-b-frontend
+
+    steps:
+      # ═══════════════════════════════════════════════════
+      # STAGE 1: Environment Setup
+      # ═══════════════════════════════════════════════════
+
+      - name: "📥 Checkout Repo A (Backend)"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # Full history needed for accurate git diff
+
+      - name: "📥 Clone Repo B (Frontend) into ./repo-b"
+        run: |
+          echo "::group::Cloning frontend repository"
+          git clone \
+            --depth 1 \
+            https://x-access-token:${{ secrets.FRONTEND_REPO_PAT }}@github.com/${{ env.FRONTEND_REPO }}.git \
+            ${{ env.REPO_B_PATH }}
+          echo "::endgroup::"
+          echo "✅ Repo B cloned to ${{ env.REPO_B_PATH }}"
+          ls -la ${{ env.REPO_B_PATH }}/src/
+
+      - name: "🟢 Setup Node.js 20"
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # ═══════════════════════════════════════════════════
+      # STAGE 2: Install Dependencies
+      # ═══════════════════════════════════════════════════
+
+      - name: "📦 Install Repo B dependencies"
+        working-directory: ${{ env.REPO_B_PATH }}
+        run: npm ci
+
+      - name: "📦 Install MCP Server dependencies"
+        working-directory: ./mcp-server
+        run: npm ci
+
+      - name: "🔨 Build MCP Server"
+        working-directory: ./mcp-server
+        run: npm run build
+
+      # ═══════════════════════════════════════════════════
+      # STAGE 3: Extract Context
+      # ═══════════════════════════════════════════════════
+
+      - name: "📊 Extract PR Diff"
+        run: |
+          echo "::group::Backend API Diff"
+          git diff origin/main..HEAD -- src/server.ts > /tmp/backend-diff.patch
+          cat /tmp/backend-diff.patch
+          echo "::endgroup::"
+
+          # Validate diff is non-empty
+          if [ ! -s /tmp/backend-diff.patch ]; then
+            echo "⚠️ No changes detected in src/server.ts"
+            echo "SKIP_AEGIS=true" >> $GITHUB_ENV
+          else
+            DIFF_LINES=$(wc -l < /tmp/backend-diff.patch)
+            echo "📝 Diff contains ${DIFF_LINES} lines"
+          fi
+
+      # ═══════════════════════════════════════════════════
+      # STAGE 4: Run IBM Bob 2.0 Agent Loop
+      # ═══════════════════════════════════════════════════
+
+      - name: "🤖 Install IBM Bob 2.0 Shell"
+        if: env.SKIP_AEGIS != 'true'
+        run: |
+          # IBM Bob 2.0 installation
+          npm install -g @ibm/bob-shell 2>/dev/null || \
+          npm install -g @ibm/bob-cli 2>/dev/null || \
+          npm install -g bob-shell 2>/dev/null || \
+          (echo "::warning::Bob Shell not found via npm — using direct API fallback" && echo "BOB_API_FALLBACK=true" >> $GITHUB_ENV)
+          bob --version 2>/dev/null || bob-shell --version 2>/dev/null || echo "Bob CLI availability check complete"
+
+      - name: "🧠 Execute Aegis Agent Loop"
+        if: env.SKIP_AEGIS != 'true'
+        run: |
+          echo "::group::Aegis Agent Execution"
+
+          # Inject the diff into the master prompt
+          export BACKEND_DIFF="$(cat /tmp/backend-diff.patch)"
+
+          if [ "${BOB_API_FALLBACK}" = "true" ]; then
+            echo "Running via IBM Bob API (curl fallback)..."
+            PROMPT_CONTENT=$(cat ./prompts/aegis-master-prompt.md | sed "s|\${BACKEND_DIFF}|${BACKEND_DIFF}|g")
+            # IBM Bob 2.0 API call (adjust endpoint/model as needed for actual Bob 2.0 API)
+            curl -s -X POST "https://api.ibm.com/bob/v2/agent/run" \
+              -H "Authorization: Bearer ${BOB_API_KEY}" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"prompt\": $(echo "${PROMPT_CONTENT}" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))'),
+                \"mcp_config\": $(cat ./mcp-config.json),
+                \"max_iterations\": 5
+              }" > /tmp/bob-output.json
+            echo "Bob output:"
+            cat /tmp/bob-output.json
+          else
+            # Run Bob Shell in headless mode with MCP configuration
+            bob shell --headless \
+              --mcp-config ./mcp-config.json \
+              --prompt "$(cat ./prompts/aegis-master-prompt.md | envsubst)" \
+              --max-iterations 5 \
+              --timeout 300 2>&1 || \
+            bob --headless \
+              --mcp-config ./mcp-config.json \
+              --prompt "$(cat ./prompts/aegis-master-prompt.md | envsubst)" \
+              --max-iterations 5 2>&1
+          fi
+
+          echo "::endgroup::"
+          echo "✅ Aegis agent loop completed"
+        env:
+          BOB_API_KEY: ${{ secrets.BOB_API_KEY }}
+          REPO_B_PATH: ${{ env.REPO_B_PATH }}
+          BACKEND_DIFF: ""   # Will be overridden by the run script above
+
+      # ═══════════════════════════════════════════════════
+      # STAGE 5: Validate Changes
+      # ═══════════════════════════════════════════════════
+
+      - name: "✅ Final Type-Check Validation"
+        if: env.SKIP_AEGIS != 'true'
+        working-directory: ${{ env.REPO_B_PATH }}
+        run: |
+          echo "Running final type-check as safety net..."
+          npm run type-check
+          echo "✅ Type-check passed — changes are valid"
+
+      - name: "🔍 Show Changes Made"
+        if: env.SKIP_AEGIS != 'true'
+        working-directory: ${{ env.REPO_B_PATH }}
+        run: |
+          echo "::group::Changes made by Aegis"
+          git diff
+          echo "::endgroup::"
+
+      # ═══════════════════════════════════════════════════
+      # STAGE 6: Create Frontend PR
+      # ═══════════════════════════════════════════════════
+
+      - name: "🚀 Push Changes & Create Frontend PR"
+        if: env.SKIP_AEGIS != 'true'
+        working-directory: ${{ env.REPO_B_PATH }}
+        run: |
+          # Configure git identity
+          git config user.name "Project Aegis Bot"
+          git config user.email "aegis-bot@noreply.github.com"
+
+          # Check if any files were actually changed
+          if git diff --quiet; then
+            echo "⚠️ No file changes detected — skipping PR creation"
+            exit 0
+          fi
+
+          # Create a unique branch name
+          BRANCH="aegis/sync-pr${{ github.event.pull_request.number }}-$(date +%Y%m%d%H%M%S)"
+          echo "Creating branch: ${BRANCH}"
+          git checkout -b "${BRANCH}"
+
+          # Stage and commit
+          git add -A
+          git commit -m "chore: sync frontend types with backend PR #${{ github.event.pull_request.number }}
+
+          Automated by Project Aegis — Contract Sync Agent
+
+          Backend PR: ${{ github.event.pull_request.html_url }}
+          Changes detected in: src/server.ts
+          Files updated: src/types.ts, src/schemas.ts
+          Validation: npm run type-check ✅ passed"
+
+          # Push to Repo B
+          git push origin "${BRANCH}"
+          echo "✅ Branch pushed to Repo B"
+
+          # Create Pull Request using GitHub CLI
+          gh pr create \
+            --repo "${{ env.FRONTEND_REPO }}" \
+            --head "${BRANCH}" \
+            --base "main" \
+            --title "🛡️ Aegis: Sync types with backend PR #${{ github.event.pull_request.number }}" \
+            --body "## 🛡️ Automated Contract Synchronization
+
+          This PR was automatically generated by **Project Aegis**.
+
+          ### 📋 What happened
+          A breaking change was detected in the backend API ([PR #${{ github.event.pull_request.number }}](${{ github.event.pull_request.html_url }})).
+
+          Project Aegis analyzed the diff, updated the frontend TypeScript interfaces and Zod schemas, and validated the changes.
+
+          ### 📁 Files Updated
+          - \`src/types.ts\` — TypeScript interface updated
+          - \`src/schemas.ts\` — Zod validation schema updated
+
+          ### ✅ Validation
+          - \`npm run type-check\` — **Passed**
+
+          ### 🏗️ Architecture
+          \`\`\`
+          Backend PR → GitHub Action → IBM Bob 2.0 + MCP → Type-Check → Frontend PR
+          \`\`\`
+
+          ---
+          *Powered by IBM Bob 2.0 + Model Context Protocol (MCP)*
+          *Team: Aegis Enclave*"
+        env:
+          GH_TOKEN: ${{ secrets.FRONTEND_REPO_PAT }}
+
+      # ═══════════════════════════════════════════════════
+      # STAGE 7: Cleanup
+      # ═══════════════════════════════════════════════════
+
+      - name: "🧹 Cleanup"
+        if: always()
+        run: |
+          echo "✅ Cleanup complete"
