@@ -117,4 +117,14 @@ The following is the `git diff` output for the backend API changes:
 ${BACKEND_DIFF}
 ```
 
-Begin your analysis now. Start with Step 1.
+## Type-Check Errors
+
+${TSC_ERRORS}
+
+> **If the section above is non-empty**, a previous attempt already wrote the files but
+> `tsc --noEmit` failed. **Skip Step 1 and Step 2.** Go directly to Step 3 and fix ONLY
+> the specific TypeScript errors listed above — do not re-analyse the diff or invent
+> additional changes. Re-read the current file contents first (Step 2) to see what was
+> written, then apply the minimal correction.
+
+Begin your analysis now. Start with Step 1 (or Step 3 if Type-Check Errors are present).

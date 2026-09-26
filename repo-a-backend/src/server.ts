@@ -1,8 +1,13 @@
 // src/server.ts
 import express, { Request, Response } from 'express';
+import cors from 'cors';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Allow cross-origin requests from the frontend (e.g. Next.js on port 3000).
+// Override the allowed origin via CORS_ORIGIN env var in production.
+app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
 
 // ───────────────────────────────────────────────
 // Data Contract: User
@@ -27,6 +32,13 @@ app.get('/api/user', (_req: Request, res: Response) => {
   res.json(user);
 });
 
-app.listen(PORT, () => {
-  console.log(`[Repo A] Backend API running on http://localhost:${PORT}`);
-});
+// Export app for integration tests — tests import this and call app.listen(0)
+// to bind a random port without starting a permanent server.
+export { app };
+
+// Only start listening when run directly (not imported by tests)
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`[Repo A] Backend API running on http://localhost:${PORT}`);
+  });
+}

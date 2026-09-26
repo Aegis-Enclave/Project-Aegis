@@ -22,6 +22,12 @@ export const ALLOWED_FILES: string[] = [
 ];
 
 /**
+ * Maximum allowed file size for MCP read/write operations (512 KB).
+ * Prevents memory exhaustion from unexpectedly large files.
+ */
+export const MAX_FILE_SIZE_BYTES = 512 * 1024; // 524 288 bytes
+
+/**
  * Server metadata for MCP registration.
  */
 export const SERVER_NAME = 'aegis-context-bridge';

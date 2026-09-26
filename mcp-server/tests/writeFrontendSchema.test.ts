@@ -64,4 +64,18 @@ describe('writeFrontendSchema', () => {
       writeFrontendSchema({ filePath: 'package.json', content: '{}' })
     ).rejects.toMatchObject({ code: 'FILE_NOT_ALLOWED' });
   });
+
+  it('throws FILE_TOO_LARGE when content exceeds 512 KB', async () => {
+    const oversized = 'x'.repeat(512 * 1024 + 1);
+    await expect(
+      writeFrontendSchema({ filePath: 'src/types.ts', content: oversized })
+    ).rejects.toMatchObject({ code: 'FILE_TOO_LARGE' });
+  });
+
+  it('leaves no .tmp file after a successful write', async () => {
+    const content = `export interface User { uuid: string; }\n`;
+    await writeFrontendSchema({ filePath: 'src/types.ts', content });
+    const tmpFile = path.join(tmpDir, 'src', '.types.ts.tmp');
+    expect(fs.existsSync(tmpFile)).toBe(false);
+  });
 });

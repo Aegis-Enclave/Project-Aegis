@@ -1,6 +1,7 @@
 // src/tools/readFrontendSchema.ts
-import { readFile } from 'fs/promises';
+import { stat, readFile } from 'fs/promises';
 import { validateAndResolvePath, McpToolError } from '../validation.js';
+import { MAX_FILE_SIZE_BYTES } from '../config.js';
 
 interface ReadInput {
   filePath: string;
@@ -25,7 +26,16 @@ interface ReadOutput {
  */
 export async function readFrontendSchema(input: ReadInput): Promise<ReadOutput> {
   // Validate and resolve path (throws on invalid)
-  const absolutePath = validateAndResolvePath(input.filePath);
+  const absolutePath = await validateAndResolvePath(input.filePath);
+
+  // Check file size before reading to avoid loading large files into memory
+  const fileStat = await stat(absolutePath);
+  if (fileStat.size > MAX_FILE_SIZE_BYTES) {
+    throw new McpToolError(
+      'FILE_TOO_LARGE',
+      `File "${input.filePath}" is ${fileStat.size} bytes, exceeding the ${MAX_FILE_SIZE_BYTES}-byte limit`
+    );
+  }
 
   // Read file
   let content: string;
