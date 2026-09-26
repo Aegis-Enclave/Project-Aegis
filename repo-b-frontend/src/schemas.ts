@@ -9,9 +9,11 @@ import { z } from 'zod';
 export const UserSchema = z.object({
   user_id: z.string(),                              // Matches User.user_id
   name: z.string(),                                 // Matches User.name
+  // Defence-in-depth: frontend enforces email format even though the backend does not.
+  // If the backend returns a non-email string here, Zod will throw at runtime.
   email: z.string().email(),                        // Matches User.email (with email validation)
   role: z.enum(['admin', 'member', 'viewer']),      // Matches User.role
-});
+}).strict(); // Reject unexpected extra fields from the backend — surfaces contract drift immediately
 
 // Inferred type — should be structurally identical to the User interface in types.ts
 export type UserFromSchema = z.infer<typeof UserSchema>;

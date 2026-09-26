@@ -92,7 +92,7 @@ jobs:
           fi
 
       # ═══════════════════════════════════════════════════
-      # STAGE 4: Run IBM Bob 2.0 Agent Loop
+      # STAGE 4: Install Bob
       # ═══════════════════════════════════════════════════
 
       - name: "🤖 Install IBM Bob 2.0 Shell"
@@ -105,62 +105,89 @@ jobs:
           (echo "::warning::Bob Shell not found via npm — using direct API fallback" && echo "BOB_API_FALLBACK=true" >> $GITHUB_ENV)
           bob --version 2>/dev/null || bob-shell --version 2>/dev/null || echo "Bob CLI availability check complete"
 
-      - name: "🧠 Execute Aegis Agent Loop"
-        if: env.SKIP_AEGIS != 'true'
-        run: |
-          echo "::group::Aegis Agent Execution"
-
-          # Inject the diff into the master prompt
-          export BACKEND_DIFF="$(cat /tmp/backend-diff.patch)"
-
-          if [ "${BOB_API_FALLBACK}" = "true" ]; then
-            echo "Running via IBM Bob API (curl fallback)..."
-            PROMPT_CONTENT=$(cat ./prompts/aegis-master-prompt.md | sed "s|\${BACKEND_DIFF}|${BACKEND_DIFF}|g")
-            # IBM Bob 2.0 API call (adjust endpoint/model as needed for actual Bob 2.0 API)
-            curl -s -X POST "https://api.ibm.com/bob/v2/agent/run" \
-              -H "Authorization: Bearer ${BOB_API_KEY}" \
-              -H "Content-Type: application/json" \
-              -d "{
-                \"prompt\": $(echo "${PROMPT_CONTENT}" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))'),
-                \"mcp_config\": $(cat ./mcp-config.json),
-                \"max_iterations\": 5
-              }" > /tmp/bob-output.json
-            echo "Bob output:"
-            cat /tmp/bob-output.json
-          else
-            # Run Bob Shell in headless mode with MCP configuration
-            bob shell --headless \
-              --mcp-config ./mcp-config.json \
-              --prompt "$(cat ./prompts/aegis-master-prompt.md | envsubst)" \
-              --max-iterations 5 \
-              --timeout 300 2>&1 || \
-            bob --headless \
-              --mcp-config ./mcp-config.json \
-              --prompt "$(cat ./prompts/aegis-master-prompt.md | envsubst)" \
-              --max-iterations 5 2>&1
-          fi
-
-          echo "::endgroup::"
-          echo "✅ Aegis agent loop completed"
-        env:
-          BOB_API_KEY: ${{ secrets.BOB_API_KEY }}
-          REPO_B_PATH: ${{ env.REPO_B_PATH }}
-          BACKEND_DIFF: ""   # Will be overridden by the run script above
-
       # ═══════════════════════════════════════════════════
-      # STAGE 5: Validate Changes
+      # STAGE 5: Agent + Validate Loop (up to 3 iterations)
+      # Each iteration: run Bob → docker type-check → break on pass
+      # or feed tsc errors back into the next prompt iteration.
       # ═══════════════════════════════════════════════════
 
-      - name: "✅ Final Type-Check Validation"
+      - name: "🔄 Aegis Sync Loop"
         if: env.SKIP_AEGIS != 'true'
         run: |
           set -o pipefail
-          IMAGE_TAG="aegis-type-check:${{ github.sha }}"
-          echo "Building validation sandbox image (tag: ${IMAGE_TAG})..."
-          docker build --no-cache -t "${IMAGE_TAG}" ${{ env.REPO_B_PATH }}
-          echo "Running type-check inside container..."
-          docker run --rm "${IMAGE_TAG}" 2>&1 | tee /tmp/type-check-output.txt
-          echo "✅ Type-check passed — changes are valid"
+
+          BACKEND_DIFF="$(cat /tmp/backend-diff.patch)"
+          export BACKEND_DIFF
+          TSC_ERRORS=""       # Empty on first iteration; populated on retry
+          AEGIS_RESULT=""
+
+          for ITER in 1 2 3; do
+            echo "::group::Aegis iteration ${ITER}/3"
+            IMAGE_TAG="aegis-type-check:${{ github.sha }}-iter-${ITER}"
+
+            # ── Build prompt for this iteration (Python substitution — shell-safe) ──
+            python3 - <<PYEOF
+import os, pathlib
+template   = pathlib.Path('./prompts/aegis-master-prompt.md').read_text()
+diff       = os.environ.get('BACKEND_DIFF', '')
+tsc_errors = os.environ.get('TSC_ERRORS', '')
+result     = template.replace('\${BACKEND_DIFF}', diff).replace('\${TSC_ERRORS}', tsc_errors)
+pathlib.Path('/tmp/aegis-prompt-iter-${ITER}.md').write_text(result)
+PYEOF
+
+            # ── Run Bob ──
+            if [ "${BOB_API_FALLBACK}" = "true" ]; then
+              echo "Iteration ${ITER}: running via IBM Bob API (curl fallback)..."
+              curl -s -X POST "https://api.ibm.com/bob/v2/agent/run" \
+                -H "Authorization: Bearer ${BOB_API_KEY}" \
+                -H "Content-Type: application/json" \
+                -d "{
+                  \"prompt\": $(python3 -c 'import sys,json; print(json.dumps(open("/tmp/aegis-prompt-iter-${ITER}.md").read()))'),
+                  \"mcp_config\": $(cat ./mcp-config.json),
+                  \"max_iterations\": 5
+                }" > /tmp/bob-output-iter-${ITER}.json
+              cat /tmp/bob-output-iter-${ITER}.json
+            else
+              bob shell --headless \
+                --mcp-config ./mcp-config.json \
+                --prompt "$(cat /tmp/aegis-prompt-iter-${ITER}.md)" \
+                --max-iterations 5 \
+                --timeout 300 2>&1 || \
+              bob --headless \
+                --mcp-config ./mcp-config.json \
+                --prompt "$(cat /tmp/aegis-prompt-iter-${ITER}.md)" \
+                --max-iterations 5 2>&1
+            fi
+
+            # ── Type-check inside Docker sandbox ──
+            echo "Building validation image (${IMAGE_TAG})..."
+            docker build --no-cache -t "${IMAGE_TAG}" ${{ env.REPO_B_PATH }}
+            TYPE_CHECK_OUTPUT=$(docker run --rm "${IMAGE_TAG}" 2>&1)
+            TYPE_CHECK_EXIT=$?
+            echo "${TYPE_CHECK_OUTPUT}" | tee /tmp/type-check-output.txt
+
+            echo "::endgroup::"
+
+            if [ ${TYPE_CHECK_EXIT} -eq 0 ]; then
+              echo "✅ Type-check passed on iteration ${ITER}"
+              AEGIS_RESULT="SYNC_COMPLETE"
+              echo "AEGIS_RESULT=SYNC_COMPLETE" >> $GITHUB_ENV
+              break
+            else
+              echo "⚠️ Type-check failed on iteration ${ITER} — feeding errors back into next prompt"
+              export TSC_ERRORS="${TYPE_CHECK_OUTPUT}"
+            fi
+          done
+
+          # If all iterations failed, mark as failed and exit non-zero
+          if [ "${AEGIS_RESULT}" != "SYNC_COMPLETE" ]; then
+            echo "AEGIS_RESULT=FAILED" >> $GITHUB_ENV
+            echo "❌ All iterations exhausted — type-check never passed"
+            exit 1
+          fi
+        env:
+          BOB_API_KEY: ${{ secrets.BOB_API_KEY }}
+          REPO_B_PATH: ${{ env.REPO_B_PATH }}
 
       - name: "💬 Post Failure Comment on PR"
         if: failure() && env.SKIP_AEGIS != 'true'
@@ -215,8 +242,8 @@ jobs:
             exit 0
           fi
 
-          # Create a unique branch name
-          BRANCH="aegis/sync-pr${{ github.event.pull_request.number }}-$(date +%Y%m%d%H%M%S)"
+          # Use github.run_id for a globally unique branch name — eliminates timestamp collisions
+          BRANCH="aegis/sync-pr${{ github.event.pull_request.number }}-${{ github.run_id }}"
           echo "Creating branch: ${BRANCH}"
           git checkout -b "${BRANCH}"
 
@@ -235,8 +262,20 @@ jobs:
           git push origin "${BRANCH}"
           echo "✅ Branch pushed to Repo B"
 
-          # Create Pull Request using GitHub CLI
-          gh pr create \
+          # Idempotency guard — skip PR creation if one already exists for this branch
+          EXISTING=$(gh pr list \
+            --repo "${{ env.FRONTEND_REPO }}" \
+            --head "${BRANCH}" \
+            --json number \
+            --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "${EXISTING}" ]; then
+            echo "⚠️ PR #${EXISTING} already exists for branch ${BRANCH} — skipping creation"
+            echo "FRONTEND_PR_URL=$(gh pr view ${EXISTING} --repo ${{ env.FRONTEND_REPO }} --json url --jq '.url')" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          # Create Pull Request using GitHub CLI — capture URL for job summary
+          FRONTEND_PR_URL=$(gh pr create \
             --repo "${{ env.FRONTEND_REPO }}" \
             --head "${BRANCH}" \
             --base "main" \
@@ -264,7 +303,9 @@ jobs:
 
           ---
           *Powered by IBM Bob 2.0 + Model Context Protocol (MCP)*
-          *Team: Aegis Enclave*"
+          *Team: Aegis Enclave*")
+          echo "✅ Frontend PR created: ${FRONTEND_PR_URL}"
+          echo "FRONTEND_PR_URL=${FRONTEND_PR_URL}" >> $GITHUB_ENV
         env:
           GH_TOKEN: ${{ secrets.FRONTEND_REPO_PAT }}
 
@@ -272,7 +313,39 @@ jobs:
       # STAGE 7: Cleanup
       # ═══════════════════════════════════════════════════
 
+      - name: "📋 Write Job Summary"
+        if: always()
+        run: |
+          DIFF_LINES=$(wc -l < /tmp/backend-diff.patch 2>/dev/null || echo "0")
+          AEGIS_STATUS="${AEGIS_RESULT:-SKIPPED}"
+          FRONTEND_PR="${FRONTEND_PR_URL:-—}"
+
+          {
+            echo "## 🛡️ Project Aegis — Run Summary"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| **Run ID** | \`${{ github.run_id }}\` |"
+            echo "| **Backend PR** | [#${{ github.event.pull_request.number }}](${{ github.event.pull_request.html_url }}) |"
+            echo "| **Triggered by** | \`${{ github.event.pull_request.user.login }}\` |"
+            echo "| **Diff size** | ${DIFF_LINES} lines |"
+            echo "| **Aegis result** | ${AEGIS_STATUS} |"
+            echo "| **Frontend PR** | ${FRONTEND_PR} |"
+            echo ""
+            if [ "${AEGIS_STATUS}" = "SYNC_COMPLETE" ]; then
+              echo "> ✅ Contract sync completed successfully."
+            elif [ "${AEGIS_STATUS}" = "SKIPPED" ]; then
+              echo "> ⏭️ No API changes detected — sync skipped."
+            else
+              echo "> ❌ Sync failed after all iterations. Manual intervention required."
+            fi
+          } >> $GITHUB_STEP_SUMMARY
+
       - name: "🧹 Cleanup"
         if: always()
         run: |
+          # Remove all Docker images created by the sync loop iterations
+          for ITER in 1 2 3; do
+            docker rmi "aegis-type-check:${{ github.sha }}-iter-${ITER}" 2>/dev/null || true
+          done
           echo "✅ Cleanup complete"

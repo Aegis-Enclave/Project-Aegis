@@ -62,4 +62,18 @@ describe('readFrontendSchema', () => {
       fs.renameSync(typesPath + '.bak', typesPath);
     }
   });
+
+  it('throws FILE_TOO_LARGE when file on disk exceeds 512 KB', async () => {
+    const schemasPath = path.join(tmpDir, 'src/schemas.ts');
+    const original = fs.readFileSync(schemasPath, 'utf-8');
+    // Write an oversized file directly (bypassing the write tool)
+    fs.writeFileSync(schemasPath, 'x'.repeat(512 * 1024 + 1), 'utf-8');
+    try {
+      await expect(readFrontendSchema({ filePath: 'src/schemas.ts' })).rejects.toMatchObject({
+        code: 'FILE_TOO_LARGE',
+      });
+    } finally {
+      fs.writeFileSync(schemasPath, original, 'utf-8');
+    }
+  });
 });

@@ -1,6 +1,8 @@
 // src/tools/writeFrontendSchema.ts
-import { writeFile } from 'fs/promises';
+import { writeFile, rename, unlink } from 'fs/promises';
+import path from 'path';
 import { validateAndResolvePath, McpToolError } from '../validation.js';
+import { MAX_FILE_SIZE_BYTES } from '../config.js';
 
 interface WriteInput {
   filePath: string;
@@ -29,17 +31,32 @@ interface WriteOutput {
  */
 export async function writeFrontendSchema(input: WriteInput): Promise<WriteOutput> {
   // Validate and resolve path (throws on invalid)
-  const absolutePath = validateAndResolvePath(input.filePath);
+  const absolutePath = await validateAndResolvePath(input.filePath);
 
   // Validate content is non-empty
   if (!input.content || input.content.trim().length === 0) {
     throw new McpToolError('WRITE_FAILED', 'Cannot write empty content to file');
   }
 
-  // Write file
+  // Reject oversized content before touching the filesystem
+  const contentBytes = Buffer.byteLength(input.content, 'utf-8');
+  if (contentBytes > MAX_FILE_SIZE_BYTES) {
+    throw new McpToolError(
+      'FILE_TOO_LARGE',
+      `Content is ${contentBytes} bytes, exceeding the ${MAX_FILE_SIZE_BYTES}-byte limit`
+    );
+  }
+
+  // Atomic write: write to a .tmp sibling then rename into place.
+  // On POSIX (Linux/macOS, including GitHub Actions ubuntu-latest), rename(2)
+  // is atomic — a crash between write and rename leaves the original untouched.
+  const tmpPath = path.join(path.dirname(absolutePath), '.' + path.basename(absolutePath) + '.tmp');
   try {
-    await writeFile(absolutePath, input.content, 'utf-8');
+    await writeFile(tmpPath, input.content, 'utf-8');
+    await rename(tmpPath, absolutePath);
   } catch (err: unknown) {
+    // Best-effort cleanup of the tmp file if rename failed
+    await unlink(tmpPath).catch(() => undefined);
     const error = err as Error;
     throw new McpToolError('WRITE_FAILED', `Failed to write file: ${error.message}`);
   }
