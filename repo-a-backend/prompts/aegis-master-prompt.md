@@ -76,9 +76,9 @@ Call `write_frontend_schema` for EACH file:
 2. `write_frontend_schema({ "filePath": "src/schemas.ts", "content": "<complete new content>" })`
 
 ### Step 5: VALIDATE (Critic Phase)
-After writing both files, the CI runner will execute `npm run type-check` in the
-frontend directory. This runs `tsc --noEmit` to verify all TypeScript types are
-consistent.
+After writing both files, the CI runner will build an isolated Docker container
+from the frontend directory and run `tsc --noEmit` inside it to verify all
+TypeScript types are consistent.
 
 - **If type-check PASSES (exit code 0):** Report success:
   ```

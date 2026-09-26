@@ -16,7 +16,7 @@ on:
 
 permissions:
   contents: read
-  pull-requests: read
+  pull-requests: write
 
 jobs:
   aegis-sync:
@@ -153,11 +153,41 @@ jobs:
 
       - name: "✅ Final Type-Check Validation"
         if: env.SKIP_AEGIS != 'true'
-        working-directory: ${{ env.REPO_B_PATH }}
         run: |
-          echo "Running final type-check as safety net..."
-          npm run type-check
+          set -o pipefail
+          IMAGE_TAG="aegis-type-check:${{ github.sha }}"
+          echo "Building validation sandbox image (tag: ${IMAGE_TAG})..."
+          docker build --no-cache -t "${IMAGE_TAG}" ${{ env.REPO_B_PATH }}
+          echo "Running type-check inside container..."
+          docker run --rm "${IMAGE_TAG}" 2>&1 | tee /tmp/type-check-output.txt
           echo "✅ Type-check passed — changes are valid"
+
+      - name: "💬 Post Failure Comment on PR"
+        if: failure() && env.SKIP_AEGIS != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TSC_OUTPUT=$(cat /tmp/type-check-output.txt 2>/dev/null || echo "(no output captured)")
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          PR_AUTHOR="${{ github.event.pull_request.user.login }}"
+          COMMENT_BODY="## 🛡️ Aegis: Type-Check Failed on PR #${PR_NUMBER}
+
+          @${PR_AUTHOR} — the automated frontend sync could not be validated. Manual intervention is required.
+
+          **Backend PR:** #${PR_NUMBER}
+          **Triggered by:** Changes in \`src/server.ts\`
+
+          ### TypeScript Errors
+          \`\`\`
+          ${TSC_OUTPUT}
+          \`\`\`
+
+          ---
+          *Powered by IBM Bob 2.0 + Model Context Protocol (MCP)*"
+
+          gh pr comment "${PR_NUMBER}" \
+            --repo "${{ github.repository }}" \
+            --body "${COMMENT_BODY}"
 
       - name: "🔍 Show Changes Made"
         if: env.SKIP_AEGIS != 'true'
