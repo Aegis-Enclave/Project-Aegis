@@ -1,0 +1,17 @@
+# aegis-consumers.yml
+# Declares downstream backends that Aegis should notify via repository_dispatch
+# after a successful frontend sync. This enables dependency-graph chaining:
+# Backend A → syncs frontend → dispatches to Backend B → B syncs its frontend.
+#
+# Each entry is a full GitHub repo slug (org/repo) that has its own aegis.yml.
+# The dispatched event type is "aegis-upstream-synced" with payload:
+#   { "upstream_pr": <number>, "upstream_repo": "<org/repo>" }
+#
+# Example:
+#   downstream_backends:
+#     - Aegis-Enclave/repo-b-backend
+#     - Aegis-Enclave/repo-c-service
+#
+# Leave the list empty (or comment all entries out) to disable chaining.
+
+downstream_backends: []

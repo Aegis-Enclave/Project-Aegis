@@ -5,7 +5,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { readFrontendSchema } from './tools/readFrontendSchema.js';
 import { writeFrontendSchema } from './tools/writeFrontendSchema.js';
-import { SERVER_NAME, SERVER_VERSION, getRepoBBasePath, ALLOWED_FILES } from './config.js';
+import { SERVER_NAME, SERVER_VERSION, getRepoBBasePath, getAllowedFiles } from './config.js';
 import { McpToolError } from './validation.js';
 
 const server = new McpServer({
@@ -95,7 +95,7 @@ async function main() {
   console.error(`[Aegis MCP] Context Bridge server started (stdio transport)`);
   console.error(`[Aegis MCP] Server: ${SERVER_NAME} v${SERVER_VERSION}`);
   console.error(`[Aegis MCP] Repo B path: ${getRepoBBasePath()}`);
-  console.error(`[Aegis MCP] Allowed files: ${ALLOWED_FILES.join(', ')}`);
+  console.error(`[Aegis MCP] Allowed files: ${getAllowedFiles().join(', ')}`);
   console.error(`[Aegis MCP] Tools: read_frontend_schema, write_frontend_schema`);
 }
 

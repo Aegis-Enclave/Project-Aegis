@@ -1,7 +1,7 @@
 // src/validation.ts
 import path from 'path';
 import { realpath } from 'fs/promises';
-import { getRepoBBasePath, ALLOWED_FILES } from './config.js';
+import { getRepoBBasePath, getAllowedFiles } from './config.js';
 
 /**
  * Custom error class for MCP tool errors.
@@ -29,11 +29,13 @@ export class McpToolError extends Error {
  * Throws McpToolError if invalid.
  */
 export async function validateAndResolvePath(filePath: string): Promise<string> {
-  // Step 1: Check against whitelist
-  if (!ALLOWED_FILES.includes(filePath)) {
+  // Step 1: Check against whitelist (evaluated at call time to pick up
+  // MONOREPO_FRONTEND_PREFIX and any other runtime env overrides)
+  const allowedFiles = getAllowedFiles();
+  if (!allowedFiles.includes(filePath)) {
     throw new McpToolError(
       'FILE_NOT_ALLOWED',
-      `File "${filePath}" is not in the allowed files list. Allowed: ${ALLOWED_FILES.join(', ')}`
+      `File "${filePath}" is not in the allowed files list. Allowed: ${allowedFiles.join(', ')}`
     );
   }
 

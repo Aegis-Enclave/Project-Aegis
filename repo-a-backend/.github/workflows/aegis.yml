@@ -14,6 +14,16 @@ on:
     paths:
       - 'src/server.ts'   # Only trigger when the API source file changes
 
+  # Manual trigger — set monorepo:true to skip the cross-repo clone and use
+  # a workspace-relative REPO_B_PATH (e.g. packages/frontend) instead.
+  workflow_dispatch:
+    inputs:
+      monorepo:
+        description: 'Run in monorepo mode (skip cross-repo clone)'
+        required: false
+        default: 'false'
+        type: boolean
+
 permissions:
   contents: read
   pull-requests: write
@@ -28,6 +38,8 @@ jobs:
       REPO_B_PATH: ./repo-b
       MCP_PORT: "3002"
       FRONTEND_REPO: Aegis-Enclave/repo-b-frontend
+      # Set to 'true' via workflow_dispatch input to skip cross-repo clone.
+      MONOREPO: ${{ github.event.inputs.monorepo || 'false' }}
 
     steps:
       # ═══════════════════════════════════════════════════
@@ -39,7 +51,11 @@ jobs:
         with:
           fetch-depth: 0   # Full history needed for accurate git diff
 
+      - name: "⏱️ Record workflow start time"
+        run: echo "AEGIS_START_TIME=$(date +%s)" >> $GITHUB_ENV
+
       - name: "📥 Clone Repo B (Frontend) into ./repo-b"
+        if: env.MONOREPO != 'true'
         run: |
           echo "::group::Cloning frontend repository"
           git clone \
@@ -118,10 +134,12 @@ jobs:
 
           BACKEND_DIFF="$(cat /tmp/backend-diff.patch)"
           export BACKEND_DIFF
-          TSC_ERRORS=""       # Empty on first iteration; populated on retry
+          export TSC_ERRORS=""   # Empty on first iteration; populated on retry
           AEGIS_RESULT=""
+          ITER_COUNT=0
 
           for ITER in 1 2 3; do
+            ITER_COUNT=${ITER}
             echo "::group::Aegis iteration ${ITER}/3"
             IMAGE_TAG="aegis-type-check:${{ github.sha }}-iter-${ITER}"
 
@@ -175,9 +193,15 @@ PYEOF
               break
             else
               echo "⚠️ Type-check failed on iteration ${ITER} — feeding errors back into next prompt"
-              export TSC_ERRORS="${TYPE_CHECK_OUTPUT}"
+              # Prefix error context with structured header so Bob knows which
+              # iteration failed and can apply a minimal targeted correction.
+              export TSC_ERRORS="=== Iteration ${ITER} tsc errors ===
+${TYPE_CHECK_OUTPUT}"
             fi
           done
+
+          # Export iteration count for job summary and metrics
+          echo "ITER_COUNT=${ITER_COUNT}" >> $GITHUB_ENV
 
           # If all iterations failed, mark as failed and exit non-zero
           if [ "${AEGIS_RESULT}" != "SYNC_COMPLETE" ]; then
@@ -193,6 +217,7 @@ PYEOF
         if: failure() && env.SKIP_AEGIS != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           TSC_OUTPUT=$(cat /tmp/type-check-output.txt 2>/dev/null || echo "(no output captured)")
           PR_NUMBER="${{ github.event.pull_request.number }}"
@@ -216,6 +241,14 @@ PYEOF
             --repo "${{ github.repository }}" \
             --body "${COMMENT_BODY}"
 
+          # Axis 4.2 — Failure notification webhook (Slack/Teams)
+          # Only fires when the secret is configured; silently no-ops otherwise.
+          if [ -n "${SLACK_WEBHOOK_URL}" ]; then
+            curl -s -X POST "${SLACK_WEBHOOK_URL}" \
+              -H "Content-Type: application/json" \
+              -d "{\"text\":\"🛡️ *Aegis failed* on backend PR #${PR_NUMBER} (run \`${{ github.run_id }}\`). tsc errors after all retry iterations. Manual intervention required. <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>\"}"
+          fi
+
       - name: "🔍 Show Changes Made"
         if: env.SKIP_AEGIS != 'true'
         working-directory: ${{ env.REPO_B_PATH }}
@@ -223,6 +256,66 @@ PYEOF
           echo "::group::Changes made by Aegis"
           git diff
           echo "::endgroup::"
+
+      # ═══════════════════════════════════════════════════
+      # STAGE 5b: Contract Changelog (Axis 4.3)
+      # Append a human-readable entry to CHANGELOG.md before
+      # the commit so every sync is historically recorded.
+      # The git add -A in the PR step picks this up automatically.
+      # ═══════════════════════════════════════════════════
+
+      - name: "📝 Append Contract Changelog"
+        if: env.SKIP_AEGIS != 'true' && env.AEGIS_RESULT == 'SYNC_COMPLETE'
+        run: |
+          CHANGELOG="${{ env.REPO_B_PATH }}/CHANGELOG.md"
+          DATE=$(date -u +%Y-%m-%d)
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          PR_URL="${{ github.event.pull_request.html_url }}"
+          RUN_ID="${{ github.run_id }}"
+
+          # Create CHANGELOG.md if it doesn't exist yet
+          if [ ! -f "${CHANGELOG}" ]; then
+            echo "# Contract Changelog" > "${CHANGELOG}"
+            echo "" >> "${CHANGELOG}"
+            echo "Auto-maintained by Project Aegis. Each entry records a sync event." >> "${CHANGELOG}"
+            echo "" >> "${CHANGELOG}"
+          fi
+
+          # Prepend new entry after the header (use a temp file to insert at top)
+          ENTRY="## [${DATE}] Backend PR #${PR_NUMBER}
+
+- **Backend PR:** [#${PR_NUMBER}](${PR_URL})
+- **Aegis run:** \`${RUN_ID}\`
+- **Files updated:** \`src/types.ts\`, \`src/schemas.ts\` (and any additional contract files)
+- **Validation:** \`npm run type-check\` passed ✅
+
+"
+          # Insert the new entry after the first heading line
+          python3 - <<PYEOF
+import pathlib, os
+changelog = pathlib.Path(os.environ['CHANGELOG'])
+text = changelog.read_text()
+entry = os.environ['ENTRY']
+# Insert after the first non-blank header line
+lines = text.splitlines(keepends=True)
+insert_at = 1
+for i, line in enumerate(lines):
+    if i > 0 and line.strip() == '':
+        insert_at = i + 1
+        break
+lines.insert(insert_at, entry)
+changelog.write_text(''.join(lines))
+PYEOF
+          echo "✅ CHANGELOG.md updated"
+        env:
+          CHANGELOG: ${{ env.REPO_B_PATH }}/CHANGELOG.md
+          ENTRY: |
+            ## [${{ env.DATE }}] Backend PR #${{ github.event.pull_request.number }}
+
+            - **Backend PR:** [#${{ github.event.pull_request.number }}](${{ github.event.pull_request.html_url }})
+            - **Aegis run:** `${{ github.run_id }}`
+            - **Files updated:** `src/types.ts`, `src/schemas.ts` (and any additional contract files)
+            - **Validation:** `npm run type-check` passed ✅
 
       # ═══════════════════════════════════════════════════
       # STAGE 6: Create Frontend PR
@@ -237,7 +330,7 @@ PYEOF
           git config user.email "aegis-bot@noreply.github.com"
 
           # Check if any files were actually changed
-          if git diff --quiet; then
+          if git diff --quiet && git diff --staged --quiet; then
             echo "⚠️ No file changes detected — skipping PR creation"
             exit 0
           fi
@@ -274,27 +367,111 @@ PYEOF
             exit 0
           fi
 
+          # ── Axis 3.3/3.4/4.5: Parse Bob output for CHANGE_CLASS, CONFIDENCE,
+          #    and FIELD_CHANGES to enrich the PR body ──
+          BOB_OUTPUT_FILE=""
+          for i in 3 2 1; do
+            if [ -f "/tmp/bob-output-iter-${i}.json" ]; then
+              BOB_OUTPUT_FILE="/tmp/bob-output-iter-${i}.json"
+              break
+            fi
+          done
+
+          CHANGE_CLASS="BREAKING"
+          CONFIDENCE="HIGH"
+          CHANGE_TABLE=""
+
+          if [ -n "${BOB_OUTPUT_FILE}" ]; then
+            CHANGE_CLASS=$(python3 -c "
+import json, sys, re
+try:
+    raw = open('${BOB_OUTPUT_FILE}').read()
+    m = re.search(r'CHANGE_CLASS:\s*(BREAKING|ADDITIVE)', raw)
+    print(m.group(1) if m else 'BREAKING')
+except Exception:
+    print('BREAKING')
+")
+            CONFIDENCE=$(python3 -c "
+import json, sys, re
+try:
+    raw = open('${BOB_OUTPUT_FILE}').read()
+    m = re.search(r'CONFIDENCE:\s*(HIGH|MEDIUM|LOW)', raw)
+    print(m.group(1) if m else 'HIGH')
+except Exception:
+    print('HIGH')
+")
+            CHANGE_TABLE=$(python3 - <<'PYEOF'
+import json, sys, re, os
+try:
+    raw = open(os.environ.get('BOB_OUTPUT_FILE', '')).read()
+    m = re.search(r'FIELD_CHANGES:\s*(\[.*?\])', raw, re.DOTALL)
+    if not m:
+        print("")
+        sys.exit(0)
+    changes = json.loads(m.group(1))
+    rows = ["| Field | Change | Before | After |", "|---|---|---|---|"]
+    for c in changes:
+        rows.append(f"| `{c.get('field','')}` | {c.get('change','')} | `{c.get('before','')}` | `{c.get('after','')}` |")
+    print('\n'.join(rows))
+except Exception:
+    print("")
+PYEOF
+)
+          fi
+
+          # Choose PR title prefix based on change class
+          if [ "${CHANGE_CLASS}" = "ADDITIVE" ]; then
+            PR_TITLE_PREFIX="✨ Additive"
+          else
+            PR_TITLE_PREFIX="⚠️ Breaking"
+          fi
+          export CHANGE_CLASS CONFIDENCE CHANGE_TABLE
+
+          # Build the "Files Updated" + change table section
+          FILES_SECTION="### 📁 Files Updated
+- \`src/types.ts\` — TypeScript interface updated
+- \`src/schemas.ts\` — Zod validation schema updated"
+
+          if [ -n "${CHANGE_TABLE}" ]; then
+            FILES_SECTION="${FILES_SECTION}
+
+### 🔍 Field Changes
+${CHANGE_TABLE}"
+          fi
+
+          # Build confidence note
+          if [ "${CONFIDENCE}" = "LOW" ] || [ "${CONFIDENCE}" = "MEDIUM" ]; then
+            CONFIDENCE_NOTE="
+> ⚠️ **Confidence: ${CONFIDENCE}** — This sync may require human review before merging."
+          else
+            CONFIDENCE_NOTE=""
+          fi
+
           # Create Pull Request using GitHub CLI — capture URL for job summary
+          PR_EXTRA_FLAGS=""
+          if [ "${CONFIDENCE}" != "HIGH" ]; then
+            PR_EXTRA_FLAGS="--label needs-human-review"
+          fi
+
           FRONTEND_PR_URL=$(gh pr create \
             --repo "${{ env.FRONTEND_REPO }}" \
             --head "${BRANCH}" \
             --base "main" \
-            --title "🛡️ Aegis: Sync types with backend PR #${{ github.event.pull_request.number }}" \
-            --body "## 🛡️ Automated Contract Synchronization
+            --title "🛡️ Aegis [${PR_TITLE_PREFIX}]: Sync types with backend PR #${{ github.event.pull_request.number }}" \
+            --body "## 🛡️ Automated Contract Synchronization${CONFIDENCE_NOTE}
 
           This PR was automatically generated by **Project Aegis**.
 
           ### 📋 What happened
-          A breaking change was detected in the backend API ([PR #${{ github.event.pull_request.number }}](${{ github.event.pull_request.html_url }})).
+          A **${CHANGE_CLASS}** change was detected in the backend API ([PR #${{ github.event.pull_request.number }}](${{ github.event.pull_request.html_url }})).
 
           Project Aegis analyzed the diff, updated the frontend TypeScript interfaces and Zod schemas, and validated the changes.
 
-          ### 📁 Files Updated
-          - \`src/types.ts\` — TypeScript interface updated
-          - \`src/schemas.ts\` — Zod validation schema updated
+          ${FILES_SECTION}
 
           ### ✅ Validation
           - \`npm run type-check\` — **Passed**
+          - **Confidence:** ${CONFIDENCE}
 
           ### 🏗️ Architecture
           \`\`\`
@@ -303,9 +480,66 @@ PYEOF
 
           ---
           *Powered by IBM Bob 2.0 + Model Context Protocol (MCP)*
-          *Team: Aegis Enclave*")
+          *Team: Aegis Enclave*" \
+            ${PR_EXTRA_FLAGS})
           echo "✅ Frontend PR created: ${FRONTEND_PR_URL}"
           echo "FRONTEND_PR_URL=${FRONTEND_PR_URL}" >> $GITHUB_ENV
+          echo "CHANGE_CLASS=${CHANGE_CLASS}" >> $GITHUB_ENV
+          echo "CONFIDENCE=${CONFIDENCE}" >> $GITHUB_ENV
+        env:
+          GH_TOKEN: ${{ secrets.FRONTEND_REPO_PAT }}
+          BOB_OUTPUT_FILE: ${{ env.BOB_OUTPUT_FILE }}
+
+      # ═══════════════════════════════════════════════════
+      # STAGE 6b: SDK Auto-Publish (Axis 2.4)
+      # Publishes a versioned npm package from the synced
+      # frontend repo after the PR is created.
+      # Requires NPM_TOKEN secret and a publishable package.json.
+      # ═══════════════════════════════════════════════════
+
+      - name: "📦 Publish SDK (npm)"
+        if: env.SKIP_AEGIS != 'true' && env.AEGIS_RESULT == 'SYNC_COMPLETE' && secrets.NPM_TOKEN != ''
+        working-directory: ${{ env.REPO_B_PATH }}
+        run: |
+          # Bump patch version without creating a git tag (already committed above)
+          npm version patch --no-git-tag-version
+          npm publish --access public
+          echo "✅ SDK published to npm"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # ═══════════════════════════════════════════════════
+      # STAGE 6c: Dependency Graph Dispatch (Axis 1.2)
+      # Emits a repository_dispatch event to each downstream
+      # backend declared in aegis-consumers.yml so the chain
+      # of Aegis workflows fires automatically.
+      # ═══════════════════════════════════════════════════
+
+      - name: "🔗 Trigger Downstream Aegis Workflows"
+        if: env.SKIP_AEGIS != 'true' && env.AEGIS_RESULT == 'SYNC_COMPLETE'
+        run: |
+          CONSUMERS_FILE="./aegis-consumers.yml"
+          if [ ! -f "${CONSUMERS_FILE}" ]; then
+            echo "ℹ️ No aegis-consumers.yml found — skipping downstream dispatch"
+            exit 0
+          fi
+
+          # Parse downstream_backends list with yq (available on ubuntu-latest via snap)
+          DOWNSTREAMS=$(yq e '.downstream_backends[]' "${CONSUMERS_FILE}" 2>/dev/null || true)
+          if [ -z "${DOWNSTREAMS}" ]; then
+            echo "ℹ️ No downstream backends declared — skipping dispatch"
+            exit 0
+          fi
+
+          while IFS= read -r REPO_SLUG; do
+            echo "Dispatching to downstream: ${REPO_SLUG}"
+            curl -s -X POST \
+              -H "Authorization: Bearer ${{ secrets.FRONTEND_REPO_PAT }}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO_SLUG}/dispatches" \
+              -d "{\"event_type\":\"aegis-upstream-synced\",\"client_payload\":{\"upstream_pr\":${{ github.event.pull_request.number }},\"upstream_repo\":\"${{ github.repository }}\"}}"
+            echo "✅ Dispatched to ${REPO_SLUG}"
+          done <<< "${DOWNSTREAMS}"
         env:
           GH_TOKEN: ${{ secrets.FRONTEND_REPO_PAT }}
 
@@ -319,6 +553,16 @@ PYEOF
           DIFF_LINES=$(wc -l < /tmp/backend-diff.patch 2>/dev/null || echo "0")
           AEGIS_STATUS="${AEGIS_RESULT:-SKIPPED}"
           FRONTEND_PR="${FRONTEND_PR_URL:-—}"
+          RETRIES="${ITER_COUNT:-0}"
+          CHANGE_CLASS_OUT="${CHANGE_CLASS:-—}"
+          CONFIDENCE_OUT="${CONFIDENCE:-—}"
+
+          # Axis 4.4 — Duration metric
+          if [ -n "${AEGIS_START_TIME}" ]; then
+            DURATION=$(( $(date +%s) - AEGIS_START_TIME ))
+          else
+            DURATION="—"
+          fi
 
           {
             echo "## 🛡️ Project Aegis — Run Summary"
@@ -330,6 +574,10 @@ PYEOF
             echo "| **Triggered by** | \`${{ github.event.pull_request.user.login }}\` |"
             echo "| **Diff size** | ${DIFF_LINES} lines |"
             echo "| **Aegis result** | ${AEGIS_STATUS} |"
+            echo "| **Change class** | ${CHANGE_CLASS_OUT} |"
+            echo "| **Confidence** | ${CONFIDENCE_OUT} |"
+            echo "| **Retry count** | ${RETRIES} |"
+            echo "| **Duration** | ${DURATION}s |"
             echo "| **Frontend PR** | ${FRONTEND_PR} |"
             echo ""
             if [ "${AEGIS_STATUS}" = "SYNC_COMPLETE" ]; then
@@ -339,6 +587,26 @@ PYEOF
             else
               echo "> ❌ Sync failed after all iterations. Manual intervention required."
             fi
+
+            # Axis 4.1 — Machine-readable JSON summary (appended after the human-readable table)
+            echo ""
+            echo "### 📊 Machine-readable summary"
+            echo '```json'
+            python3 -c "
+import json, os
+print(json.dumps({
+    'run_id': '${{ github.run_id }}',
+    'backend_pr': ${{ github.event.pull_request.number || 0 }},
+    'diff_lines': int(os.popen('wc -l < /tmp/backend-diff.patch 2>/dev/null || echo 0').read().strip()),
+    'aegis_result': os.environ.get('AEGIS_RESULT', 'SKIPPED'),
+    'change_class': os.environ.get('CHANGE_CLASS', None),
+    'confidence': os.environ.get('CONFIDENCE', None),
+    'retry_count': int(os.environ.get('ITER_COUNT', '0')),
+    'duration_seconds': int(os.environ.get('DURATION', '0')) if os.environ.get('DURATION', '—') != '—' else None,
+    'frontend_pr_url': os.environ.get('FRONTEND_PR_URL', None),
+}, indent=2))
+"
+            echo '```'
           } >> $GITHUB_STEP_SUMMARY
 
       - name: "🧹 Cleanup"
@@ -349,3 +617,163 @@ PYEOF
             docker rmi "aegis-type-check:${{ github.sha }}-iter-${ITER}" 2>/dev/null || true
           done
           echo "✅ Cleanup complete"
+
+  # ═══════════════════════════════════════════════════════════════
+  # Axis 1.1 — Fan-out matrix job
+  # Syncs types to MULTIPLE frontend consumers simultaneously.
+  # Each entry in the matrix gets its own clone, Bob run, and PR.
+  # The primary aegis-sync job above handles the default consumer.
+  # Additional consumers are declared here.
+  # To activate: add entries to the matrix below and ensure
+  # FRONTEND_REPO_PAT has write access to each consumer repo.
+  # ═══════════════════════════════════════════════════════════════
+
+  aegis-sync-fanout:
+    name: "Fan-out Sync — ${{ matrix.consumer.name }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: false   # Set to: github.event_name == 'pull_request' to activate fan-out
+
+    strategy:
+      fail-fast: false   # One failing consumer does not cancel the others
+      matrix:
+        consumer:
+          # Add additional frontend consumers here:
+          # - name: mobile-client
+          #   repo: Aegis-Enclave/repo-mobile
+          #   path: ./repo-mobile
+          # - name: admin-dashboard
+          #   repo: Aegis-Enclave/repo-admin
+          #   path: ./repo-admin
+          - name: placeholder
+            repo: Aegis-Enclave/repo-b-frontend
+            path: ./repo-b-fanout
+
+    env:
+      REPO_B_PATH: ${{ matrix.consumer.path }}
+      FRONTEND_REPO: ${{ matrix.consumer.repo }}
+      MCP_PORT: "3002"
+
+    steps:
+      - name: "📥 Checkout Repo A (Backend)"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "📥 Clone consumer — ${{ matrix.consumer.name }}"
+        run: |
+          git clone \
+            --depth 1 \
+            https://x-access-token:${{ secrets.FRONTEND_REPO_PAT }}@github.com/${{ matrix.consumer.repo }}.git \
+            ${{ matrix.consumer.path }}
+
+      - name: "🟢 Setup Node.js 20"
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: "📦 Install consumer dependencies"
+        working-directory: ${{ matrix.consumer.path }}
+        run: npm ci
+
+      - name: "📦 Install MCP Server dependencies"
+        working-directory: ./mcp-server
+        run: npm ci
+
+      - name: "🔨 Build MCP Server"
+        working-directory: ./mcp-server
+        run: npm run build
+
+      - name: "📊 Extract PR Diff"
+        run: |
+          git diff origin/main..HEAD -- src/server.ts > /tmp/backend-diff.patch
+          if [ ! -s /tmp/backend-diff.patch ]; then
+            echo "SKIP_AEGIS=true" >> $GITHUB_ENV
+          fi
+
+      - name: "🤖 Install IBM Bob 2.0 Shell"
+        if: env.SKIP_AEGIS != 'true'
+        run: |
+          npm install -g @ibm/bob-shell 2>/dev/null || \
+          npm install -g @ibm/bob-cli 2>/dev/null || \
+          npm install -g bob-shell 2>/dev/null || \
+          (echo "BOB_API_FALLBACK=true" >> $GITHUB_ENV)
+
+      - name: "🔄 Aegis Sync Loop — ${{ matrix.consumer.name }}"
+        if: env.SKIP_AEGIS != 'true'
+        run: |
+          set -o pipefail
+          BACKEND_DIFF="$(cat /tmp/backend-diff.patch)"
+          export BACKEND_DIFF
+          export TSC_ERRORS=""
+          AEGIS_RESULT=""
+
+          for ITER in 1 2 3; do
+            IMAGE_TAG="aegis-fanout-${{ matrix.consumer.name }}-${{ github.sha }}-iter-${ITER}"
+            python3 - <<PYEOF
+import os, pathlib
+template   = pathlib.Path('./prompts/aegis-master-prompt.md').read_text()
+diff       = os.environ.get('BACKEND_DIFF', '')
+tsc_errors = os.environ.get('TSC_ERRORS', '')
+result     = template.replace('\${BACKEND_DIFF}', diff).replace('\${TSC_ERRORS}', tsc_errors)
+pathlib.Path('/tmp/aegis-prompt-iter-${ITER}.md').write_text(result)
+PYEOF
+            if [ "${BOB_API_FALLBACK}" = "true" ]; then
+              curl -s -X POST "https://api.ibm.com/bob/v2/agent/run" \
+                -H "Authorization: Bearer ${BOB_API_KEY}" \
+                -H "Content-Type: application/json" \
+                -d "{\"prompt\": $(python3 -c 'import json; print(json.dumps(open("/tmp/aegis-prompt-iter-${ITER}.md").read()))'), \"mcp_config\": $(cat ./mcp-config.json), \"max_iterations\": 5}" \
+                > /tmp/bob-output-iter-${ITER}.json
+            else
+              bob shell --headless --mcp-config ./mcp-config.json \
+                --prompt "$(cat /tmp/aegis-prompt-iter-${ITER}.md)" \
+                --max-iterations 5 --timeout 300 2>&1 || \
+              bob --headless --mcp-config ./mcp-config.json \
+                --prompt "$(cat /tmp/aegis-prompt-iter-${ITER}.md)" \
+                --max-iterations 5 2>&1
+            fi
+            docker build --no-cache -t "${IMAGE_TAG}" ${{ matrix.consumer.path }}
+            TYPE_CHECK_OUTPUT=$(docker run --rm "${IMAGE_TAG}" 2>&1)
+            TYPE_CHECK_EXIT=$?
+            echo "${TYPE_CHECK_OUTPUT}" | tee /tmp/type-check-output.txt
+            if [ ${TYPE_CHECK_EXIT} -eq 0 ]; then
+              AEGIS_RESULT="SYNC_COMPLETE"
+              echo "AEGIS_RESULT=SYNC_COMPLETE" >> $GITHUB_ENV
+              break
+            else
+              export TSC_ERRORS="=== Iteration ${ITER} tsc errors ===
+${TYPE_CHECK_OUTPUT}"
+            fi
+          done
+
+          if [ "${AEGIS_RESULT}" != "SYNC_COMPLETE" ]; then
+            echo "AEGIS_RESULT=FAILED" >> $GITHUB_ENV
+            exit 1
+          fi
+        env:
+          BOB_API_KEY: ${{ secrets.BOB_API_KEY }}
+          REPO_B_PATH: ${{ matrix.consumer.path }}
+
+      - name: "🚀 Push & Create PR — ${{ matrix.consumer.name }}"
+        if: env.SKIP_AEGIS != 'true'
+        working-directory: ${{ matrix.consumer.path }}
+        run: |
+          git config user.name "Project Aegis Bot"
+          git config user.email "aegis-bot@noreply.github.com"
+          if git diff --quiet && git diff --staged --quiet; then
+            echo "No changes — skipping PR"
+            exit 0
+          fi
+          BRANCH="aegis/fanout-${{ matrix.consumer.name }}-pr${{ github.event.pull_request.number }}-${{ github.run_id }}"
+          git checkout -b "${BRANCH}"
+          git add -A
+          git commit -m "chore: sync types from backend PR #${{ github.event.pull_request.number }} [${{ matrix.consumer.name }}]"
+          git push origin "${BRANCH}"
+          gh pr create \
+            --repo "${{ matrix.consumer.repo }}" \
+            --head "${BRANCH}" \
+            --base "main" \
+            --title "🛡️ Aegis: Sync types with backend PR #${{ github.event.pull_request.number }} [${{ matrix.consumer.name }}]" \
+            --body "Automated type sync from backend PR #${{ github.event.pull_request.number }}. Consumer: \`${{ matrix.consumer.name }}\`."
+        env:
+          GH_TOKEN: ${{ secrets.FRONTEND_REPO_PAT }}
